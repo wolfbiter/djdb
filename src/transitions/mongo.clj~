@@ -1,0 +1,297 @@
+;; MongerDB interop
+
+; CAPITALS signify particularly important methods
+
+; Entry methods: count-db, ADD, RETRIEVE, DELETE, FULL-SEARCH, find-not-tag,
+;                get-info, delete-dupes, any?, EDIT, TAG, RM-TAG, FIND-TAG,
+;                update-matches,
+
+; Try not to delete anything from playlist "all", as this is where all samples will
+; exist after conversion. If you want to delete a sample from ease's knowledge,
+; use method erase-sample from namespace ease.storage. This will remove the sample's
+; binary from ease's data-dir, and the metadata from playlist "all", but not from
+; other playlists which may confuse ease. So be careful.
+
+(ns ease.mongo
+  (:use [ease.config]
+        [ease.debug]
+        [monger.core :only [connect! set-db! get-db]]
+        [monger.collection
+         :only [update insert-batch find-maps remove save]
+         :rename {update update-db remove remove-db save save-db
+                  find-maps find-maps-db}]))
+
+(defn activate-db
+  "Initialize this db with given name."
+  [name]
+  (do (connect!)
+      (set-db! (get-db name))))
+
+(activate-db doc-name)
+
+(defn _retrieve
+  "Defaults the document to ease.config/doc-name for consistency and abstraction."
+  [& args]
+  (apply find-maps-db (cons doc-name args)))
+
+(defn _update
+  "Defaults the document to ease.config/doc-name for consistency and abstraction."
+  [& args]
+  (apply update-db (cons doc-name args)))
+
+(defn _remove
+  "Defaults the document to ease.config/doc-name for consistency and abstraction."
+  [& args]
+  (apply remove-db (cons doc-name args)))
+  
+(defn _save
+  "Defaults the document to ease.config/doc-name for consistency and abstraction."
+  [& args]
+  (apply save-db (cons doc-name args)))
+
+(defn _save-batch
+  "Defaults the document to ease.config/doc-name for consistency and abstraction."
+  [& args]
+  (apply insert-batch (cons doc-name args)))
+
+(defn _id-map
+  "Extracts the id of given sample and returns it in the map form of:
+   {:_id extracted-id}."
+  [sample]
+  {:_id (:_id sample)})
+
+(defn _get-sample
+  "Returns the sample from ease's metadata database matching given id-map in the
+   form of {:_id id}."
+  [id-map]
+  (first (_retrieve id-map)))
+
+(defn _assert-not-empty
+  "Returns nil if this is an empty coll, and the coll otherwise."
+  [coll]
+  (if (nil? (first coll)) nil coll))
+
+(defn delete
+  "Removes given sample(s)'s metadata from ease's metadatabase. Does NOT remove
+   the corresponding folder from ease's data-dir."
+  [samples]
+  (handle-coll-or-map "delete"
+                       #(_remove (_id-map %))
+                       (make-coll-recursive-fn delete)
+                       samples))
+
+(defn find-samples
+  "Returns a list of all samples with given criteria map, or nil. (find-samples)
+   returns all samples. Operator is an optional argument for additional functionality,
+   refer to monger for more info on the operators. TODO: add documentation on operators."
+  ([] (_assert-not-empty (_retrieve)))
+  ([criteria] (_assert-not-empty (_retrieve criteria)))
+  ([operator criteria]
+     (_assert-not-empty (_retrieve {operator criteria}))))
+
+(defn _edit-fxn-for-map
+  "Functions to be called when performing edit on a sample map."
+  [sample criteria]
+  (if-let [id (_id-map sample)]  ; if sample has an :_id
+    (do (_update id criteria)    ; make the changes
+        (_get-sample id))
+    (if-let [updated-sample (find-samples sample)]      ; if sample had no :_id, update
+      (_edit-fxn-for-map updated-sample criteria)))) ; then try again
+             
+(defn add
+  "Adds (and returns) given sample(s)'s metadata to ease's metadatabase.
+   Returns list if given a list, sample if given a sample."
+  [samples]
+  (handle-coll-or-map "add"
+                       #(do (_save %) (first (find-samples %)))
+                       #(_save-batch (vec %))
+                       samples))
+
+(defn edit
+  "Edits given sample's or list of samples' info with given criteria in the form
+   of a map. If given sample does not have an :_id field, will attempt to find the
+   sample which matches given sample's info. CAUTION: edit WILL replace the stored
+   sample with given criteria if given no operators.
+   Returns the updated sample or list of samples."
+  [samples criteria]
+  (handle-coll-or-map "edit"
+                      _edit-fxn-for-map
+                      (make-coll-recursive-fn edit)
+                      samples
+                      criteria))
+
+(defn remove-field
+  "Removes given fields from given samples.
+   Returns the updated sample or list."
+  [samples & fields]
+  (last (map #(edit samples {"$unset" {% 1}}) fields)))
+
+(defn add-to-field
+  "Updates given sample(s)'s given field's array in given playlist to also
+   contain given input. Not destructive.
+   Returns updated sample or list."
+  [samples field & input]
+  (edit samples {"$pushAll" {field (vec (flatten input))}}))
+
+(defn remove-from-field
+  "Updates given sample(s)'s given field's array in given playlist to no longer
+   contain any of given input. Returns the updated sample or list."
+  [samples field & input]
+  (edit samples {"$pullAll" {field (vec (flatten input))}}))
+
+(defn set-fields
+  "Updates given sample(s)'s fields in given playlist with given criteria data.
+   Returns the updated sample or list. Destructive to old field data."
+  [samples criteria]
+  (edit samples {"$set" criteria}))
+
+(defn attach
+  "Attaches given sample or list of samples to given playlist. Updates :playlists in
+  given sample(s)'s metadata. Returns the updated sample or list of samples."
+  [playlist samples]
+  (add-to-field samples :playlist playlist))
+
+(defn detach
+  "Detaches given sample or list of samples from given playlist. Updates :playlists
+  in given sample(s)'s metadata. Returns the updated sample or list of samples."
+  [playlist samples]
+  (remove-from-field samples :playlist playlist))
+
+(defn get-playlist
+  "Returns a list of all samples that are attached to given playlist, or nil.
+   Playlist is a string."
+  [playlist]
+  (find-samples {:playlist playlist}))
+
+(defn _make-regex
+  "Takes given string and returns a mongodb searchable array of case insensitive
+   regex's, operator and all."
+  [query]
+  {"$regex" (_remove-bad-regex query) "$options" "i"})
+
+(defn _make-one-search-map
+  "Turns given query into regexps, then returns a map consisting of given field
+   with the regexp query as the value."
+  [field query]
+  {field (_make-regex query)})
+
+(defn _make-search-maps
+  "Generates a search map for each field and query combination."
+  [fields queries]
+  {"$or" (vec (flatten (for [field fields
+                             query queries]
+                         (_make-one-search-map field query))))})
+
+(defn search
+  "Returns a list of all samples that have given query or queries in any of the
+   three following fields: title, artist, source. Or returns nil if no matches."
+  [& queries]
+  (find-samples (_make-search-maps [:title :artists :sources] queries)))
+
+(defn search-playlist
+  "Returns a list of all samples in playlist that have any given query or queries in any
+   of the three following fields: title, artist, source. Or returns nil if no matches."
+  [playlist fields queries]
+  (find-samples {"$and" [{:playlist playlist}
+                      (_make-search-maps fields queries)]}))
+
+(defn search-fields
+  "Returns a list of all samples that have any case insensitive regexp match to any
+   query in given vector queries in any field of vector fields, or nil."
+  ; TODO: make this be a map of vectors and/or strings to link fields to queries
+  [fields queries]
+  (find-samples (_make-search-maps fields queries)))
+
+(defn find-tag
+  "Returns a list of all samples with any of the given tag(s), or nil."
+  [& tags]
+  (find-samples {:tags {"$in" (vec tags)}}))
+
+(defn find-not-tag
+  "Returns a list of samples without any of the given tag(s), or nil."
+  [& tags]
+  (find-samples {:tags {"$nin" (vec tags)}}))
+
+(defn tag
+  "Adds given tag(s) to given samples. Returns a list of the updated
+   sample(s). Note: duplicate tags are skipped."
+  [samples & tags]
+  (last (map #(edit samples {"$addToSet" {:tags %}}) tags)))
+
+(defn untag
+  "Removes given tag(s) from given samples. Returns the updated sample or list."
+  [samples & tags]
+  (remove-from-field samples :tags tags))
+
+(defn set-title
+  "Updates given sample(s)'s with new given title and returns the updated sample
+   or list.
+   Destructive to old data."
+  [samples new-title]
+  (set-fields samples {:title new-title}))
+
+(defn set-mod
+  "Updates given sample(s)'s with new given mod and returns the updated
+   sample(s). Destructive to old data."
+  [samples new-mod]
+  (set-fields samples {:mod new-mod}))
+  
+(defn set-artists
+  "Updates given sample(s)'s with new given artists and returns the updated
+   sample(s). Destructive to old data."
+  [samples & new-artists]
+  (set-fields samples {:artists new-artists}))
+
+(defn set-sources
+  "Updates given sample(s)'s with new given sources and returns the updated
+   sample(s). Destructive to old data."
+  [samples & new-sources]
+  (set-fields samples {:sources new-sources}))
+
+(defn add-artists
+  "Adds given artist(s) to given sample(s), and returns the updated sample(s).
+   Nondestructive."
+  [samples & new-artists]
+  (add-to-field samples :artists new-artists))
+
+(defn add-sources
+  "Adds given source(s) to given sample(s), and returns the updated sample(s).
+   Nondestructive."
+  [samples & new-sources]
+  (add-to-field samples :sources new-sources))
+
+;; OLD
+(comment
+  
+(defn safe-delete
+  "Prompts the user to make sure they REALLY want to do it...
+   'd' 'y' '<enter>' are shortcuts."
+  [playlist input]
+  (let [n (count-db playlist input)]
+    (if (not (= 0 n))
+      (do (println "Really delete" n "sample(s)? 'yes' 'details'")
+          ; Loop to allow for asking details
+          (loop [response (lower-case (read-line))]
+            (cond (.contains response "n")
+                  (println "Cancelled")
+                  (or (= "" response) (.contains response "y"))
+                  (do (print "Deleted all matches in" playlist "to: ")
+                      (println (if (= {} input) "Everything." input))
+                      (del playlist input))
+                  (.contains response "d")
+                  (do (doall (map #(println %) (_retrieve playlist input)))
+                      (recur (lower-case (read-line)))))))
+      (println "No matches to delete."))))
+
+(defn get-info
+  "Returns a list of all matches to the given key from all samples in given playlist"
+  [playlist k]
+  (cond (string? playlist)
+        (doall (for [sample (_retrieve playlist)] (k sample)))
+        (coll? playlist)
+        (doall (for [sample playlist] (k sample)))))
+
+(defn titles [playlist]
+  (get-info playlist :title))
+
+)
